@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "IA PROTEC Update Manifest",
+  "type": "object",
+  "required": ["version", "installer", "sha256"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "installer": {
+      "type": "string"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "release_notes_url": {
+      "type": "string",
+      "format": "uri"
+    },
+    "mandatory": {
+      "type": "boolean"
+    }
+  }
+}

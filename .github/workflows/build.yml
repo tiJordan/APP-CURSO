@@ -1,0 +1,121 @@
+name: Build & Publish IA PROTEC
+
+# Executa em cada push de tag vX.Y.Z
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+
+    steps:
+      # 1) Checkout do código
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      # 2) Setup Python 3.11
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      # 3) Instalar dependências
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller packaging
+
+      # 4) Gerar executável com PyInstaller
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller --clean --onefile --noconsole \
+            --name "IA PROTEC" \
+            --icon "assets/icone_app.ico" \
+            --add-data "assets;assets" \
+            --add-data "installer;installer" \
+            main.py
+
+      # 5) Verificar presence do .exe
+      - name: List dist folder
+        run: dir dist
+
+      # 6) Build MSI via Advanced Installer (ver canvas)
+      - name: Build MSI via Advanced Installer
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          "C:\\Program Files (x86)\\Caphyon\\Advanced Installer 22.9\\AdvancedInstaller.com" \
+            /build "installer/PROTEC IA.aip" \
+            /Set ProductVersion=%RELEASE_TAG:~1% \
+            /Set OutputPath=dist\
+
+      # 7) Calcular SHA-256 do MSI
+      - name: Calculate MSI SHA-256
+        shell: powershell
+        run: |
+          $msi = Get-ChildItem dist\*.msi | Select-Object -First 1
+          $hash = (Get-FileHash -Algorithm SHA256 $msi.FullName).Hash
+          echo "MSI_SHA256=$hash" >> $Env:GITHUB_ENV
+
+      # 8) Create GitHub Release
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
+      # 9) Upload MSI to Release
+      - name: Upload MSI asset
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: dist\*.msi
+          asset_name: IA\ PROTEC_${{ github.ref_name }}.msi
+          asset_content_type: application/octet-stream
+
+      # 10) Montar version.json
+      - name: Build version.json
+        shell: bash
+        env:
+          MSI_SHA256: ${{ env.MSI_SHA256 }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat <<EOF > version.json
+          {
+            "version": "$VERSION",
+            "installer": "protecapp.msi",
+            "sha256": "$MSI_SHA256",
+            "release_notes_url": "https://github.com/jordanti/IA-Protec/releases/tag/$GITHUB_REF_NAME",
+            "mandatory": false
+          }
+          EOF
+
+      # 11) Copy version.json to network share
+      - name: Publish manifest to share
+        env:
+          SMB_USER: ${{ secrets.SMB_USER }}
+          SMB_PASS: ${{ secrets.SMB_PASS }}
+        run: |
+          net use \\SRV-AD02\DEPLOY /user:%SMB_USER% %SMB_PASS%
+          copy version.json \\SRV-AD02\DEPLOY\version.json
+          copy dist\protecapp.msi \\SRV-AD02\DEPLOY\protecapp.msi
+          net use \\SRV-AD02\DEPLOY /delete
+    
+      
+      # 12) Validate version.json against schema
+      - name: Validate manifest.json (Python)
+        run: |
+          pip install jsonschema
+          python - <<PYCODE
+          import json, jsonschema
+          schema = json.load(open('installer/manifest-schema.json'))
+          manifest = json.load(open('version.json'))
+          jsonschema.validate(manifest, schema)
+          print("Manifest OK")
+          PYCODE
