@@ -11,55 +11,55 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # 1) Checkout do código
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      # 2) Setup Python 3.11
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # 3) Instalar dependências
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller packaging
+          pip install pyinstaller packaging jsonschema
 
-      # 4) Gerar executável com PyInstaller
+      # <<<<<< ERRO aqui — corrigido >>>>>>
       - name: Build EXE with PyInstaller
-        run: |
-          pyinstaller --clean --onefile --noconsole \
-            --name "IA PROTEC" \
-            --icon "assets/icone_app.ico" \
-            --add-data "assets;assets" \
-            --add-data "installer;installer" \
-            main.py
+        shell: pwsh
+        run: pyinstaller --clean --onefile --noconsole --name "IA PROTEC" --icon "assets/icone_app.ico" --add-data "assets;assets" --add-data "installer/manifest-schema.json;installer" main.py
 
-      # 5) Verificar presence do .exe
-      - name: List dist folder
+      - name: List dist
+        shell: pwsh
         run: dir dist
 
-      # 6) Build MSI via Advanced Installer (ver canvas)
+      # Se o runner NÃO tiver o Advanced Installer instalado,
+      # este passo vai falhar. Use self-hosted com AI 22.9 ou pule este passo.
       - name: Build MSI via Advanced Installer
+        shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          "C:\\Program Files (x86)\\Caphyon\\Advanced Installer 22.9\\AdvancedInstaller.com" \
-            /build "installer/PROTEC IA.aip" \
-            /Set ProductVersion=%RELEASE_TAG:~1% \
-            /Set OutputPath=dist\
+          $ver = $Env:RELEASE_TAG.TrimStart('v')
+          $ai  = 'C:\Program Files (x86)\Caphyon\Advanced Installer 22.9\AdvancedInstaller.com'
+          & $ai /build "installer/PROTEC IA.aip" /SetVersion $ver /SetOutputPath "dist\"
 
-      # 7) Calcular SHA-256 do MSI
-      - name: Calculate MSI SHA-256
-        shell: powershell
+      - name: Capture MSI path
+        id: msi
+        shell: pwsh
         run: |
           $msi = Get-ChildItem dist\*.msi | Select-Object -First 1
-          $hash = (Get-FileHash -Algorithm SHA256 $msi.FullName).Hash
-          echo "MSI_SHA256=$hash" >> $Env:GITHUB_ENV
+          if (-not $msi) { throw "MSI não encontrado em dist\" }
+          "MSI_PATH=$($msi.FullName)" | Out-File -Append -Encoding utf8 $Env:GITHUB_ENV
+          "MSI_NAME=$($msi.Name)"     | Out-File -Append -Encoding utf8 $Env:GITHUB_ENV
 
-      # 8) Create GitHub Release
+      - name: Calculate MSI SHA-256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 $Env:MSI_PATH).Hash.ToLower()
+          "MSI_SHA256=$hash" | Out-File -Append -Encoding utf8 $Env:GITHUB_ENV
+
       - name: Create Release
         id: create_release
         uses: actions/create-release@v1
@@ -69,53 +69,51 @@ jobs:
           draft: false
           prerelease: false
 
-      # 9) Upload MSI to Release
       - name: Upload MSI asset
         uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: dist\*.msi
-          asset_name: IA\ PROTEC_${{ github.ref_name }}.msi
+          asset_path: ${{ env.MSI_PATH }}
+          asset_name: ${{ env.MSI_NAME }}
           asset_content_type: application/octet-stream
 
-      # 10) Montar version.json
       - name: Build version.json
-        shell: bash
-        env:
-          MSI_SHA256: ${{ env.MSI_SHA256 }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+        shell: pwsh
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          cat <<EOF > version.json
+          $ver = $Env:GITHUB_REF_NAME.TrimStart('v')
+          $json = @"
           {
-            "version": "$VERSION",
-            "installer": "protecapp.msi",
-            "sha256": "$MSI_SHA256",
-            "release_notes_url": "https://github.com/jordanti/IA-Protec/releases/tag/$GITHUB_REF_NAME",
+            "version": "$ver",
+            "installer": "$Env:MSI_NAME",
+            "sha256": "$Env:MSI_SHA256",
+            "release_notes_url": "https://github.com/${{ github.repository }}/releases/tag/$($Env:GITHUB_REF_NAME)",
             "mandatory": false
           }
-          EOF
+          "@
+          $json | Out-File -Encoding utf8 version.json
 
-      # 11) Copy version.json to network share
       - name: Publish manifest to share
+        shell: pwsh
         env:
           SMB_USER: ${{ secrets.SMB_USER }}
           SMB_PASS: ${{ secrets.SMB_PASS }}
         run: |
-          net use \\SRV-AD02\DEPLOY /user:%SMB_USER% %SMB_PASS%
-          copy version.json \\SRV-AD02\DEPLOY\version.json
-          copy dist\protecapp.msi \\SRV-AD02\DEPLOY\protecapp.msi
+          net use \\SRV-AD02\DEPLOY /user:$Env:SMB_USER $Env:SMB_PASS
+          copy /Y version.json \\SRV-AD02\DEPLOY\version.json
+          copy /Y "$Env:MSI_PATH" \\SRV-AD02\DEPLOY\$Env:MSI_NAME
           net use \\SRV-AD02\DEPLOY /delete
-    
-      
-      # 12) Validate version.json against schema
+
       - name: Validate manifest.json (Python)
+        shell: pwsh
         run: |
-          pip install jsonschema
-          python - <<PYCODE
-          import json, jsonschema
-          schema = json.load(open('installer/manifest-schema.json'))
-          manifest = json.load(open('version.json'))
+          python - << 'PYCODE'
+          import json, jsonschema, io, sys
+          with open('installer/manifest-schema.json', encoding='utf-8') as f: schema = json.load(f)
+          with open('version.json', encoding='utf-8') as f: manifest = json.load(f)
           jsonschema.validate(manifest, schema)
           print("Manifest OK")
           PYCODE
+
+      - name: Done
+        shell: pwsh
+        run: echo "Build and publish OK for $Env:GITHUB_REF_NAME"
