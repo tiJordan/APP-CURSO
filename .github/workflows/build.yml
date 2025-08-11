@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-and-publish:
-    runs-on: windows-latest
+    runs-on: [self-hosted, windows, ai-22_9]   # usa o runner com esses labels
 
     steps:
       - name: Checkout repo
@@ -25,27 +25,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller packaging jsonschema
 
-      # <<<<<< ERRO aqui — corrigido >>>>>>
+      # Build do EXE (PowerShell: linha única ou crases ` para quebrar linha)
       - name: Build EXE with PyInstaller
         shell: pwsh
         run: pyinstaller --clean --onefile --noconsole --name "IA PROTEC" --icon "assets/icone_app.ico" --add-data "assets;assets" --add-data "installer/manifest-schema.json;installer" main.py
 
-      - name: List dist
+      - name: Locate Advanced Installer
+        id: ai
         shell: pwsh
-        run: dir dist
+        run: |
+          $cands = @(
+            'C:\Program Files (x86)\Caphyon\Advanced Installer 22.9\AdvancedInstaller.com',
+            'C:\Program Files\Caphyon\Advanced Installer 22.9\AdvancedInstaller.com'
+          )
+          $ai = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($ai) { "AI_EXE=$ai" | Out-File -Append -Encoding utf8 $Env:GITHUB_ENV; "HAS_AI=true"  | Out-File -Append -Encoding utf8 $Env:GITHUB_ENV }
+          else     { "HAS_AI=false" | Out-File -Append -Encoding utf8 $Env:GITHUB_ENV; exit 0 }
 
-      # Se o runner NÃO tiver o Advanced Installer instalado,
-      # este passo vai falhar. Use self-hosted com AI 22.9 ou pule este passo.
       - name: Build MSI via Advanced Installer
+        if: env.HAS_AI == 'true'
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           $ver = $Env:RELEASE_TAG.TrimStart('v')
-          $ai  = 'C:\Program Files (x86)\Caphyon\Advanced Installer 22.9\AdvancedInstaller.com'
-          & $ai /build "installer/PROTEC IA.aip" /SetVersion $ver /SetOutputPath "dist\"
+          & "${Env:AI_EXE}" /build "installer/PROTEC IA.aip" /SetVersion $ver /SetOutputPath "dist\"
 
       - name: Capture MSI path
+        if: env.HAS_AI == 'true'
         id: msi
         shell: pwsh
         run: |
@@ -55,13 +62,13 @@ jobs:
           "MSI_NAME=$($msi.Name)"     | Out-File -Append -Encoding utf8 $Env:GITHUB_ENV
 
       - name: Calculate MSI SHA-256
+        if: env.HAS_AI == 'true'
         shell: pwsh
         run: |
           $hash = (Get-FileHash -Algorithm SHA256 $Env:MSI_PATH).Hash.ToLower()
           "MSI_SHA256=$hash" | Out-File -Append -Encoding utf8 $Env:GITHUB_ENV
 
       - name: Create Release
-        id: create_release
         uses: actions/create-release@v1
         with:
           tag_name: ${{ github.ref_name }}
@@ -69,7 +76,8 @@ jobs:
           draft: false
           prerelease: false
 
-      - name: Upload MSI asset
+      - name: Upload MSI to Release
+        if: env.HAS_AI == 'true'
         uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
@@ -77,7 +85,8 @@ jobs:
           asset_name: ${{ env.MSI_NAME }}
           asset_content_type: application/octet-stream
 
-      - name: Build version.json
+      - name: Build version.json (quando AI rodar)
+        if: env.HAS_AI == 'true'
         shell: pwsh
         run: |
           $ver = $Env:GITHUB_REF_NAME.TrimStart('v')
@@ -93,6 +102,7 @@ jobs:
           $json | Out-File -Encoding utf8 version.json
 
       - name: Publish manifest to share
+        if: env.HAS_AI == 'true'
         shell: pwsh
         env:
           SMB_USER: ${{ secrets.SMB_USER }}
@@ -103,17 +113,14 @@ jobs:
           copy /Y "$Env:MSI_PATH" \\SRV-AD02\DEPLOY\$Env:MSI_NAME
           net use \\SRV-AD02\DEPLOY /delete
 
-      - name: Validate manifest.json (Python)
+      - name: Validate manifest.json
+        if: env.HAS_AI == 'true'
         shell: pwsh
         run: |
           python - << 'PYCODE'
-          import json, jsonschema, io, sys
-          with open('installer/manifest-schema.json', encoding='utf-8') as f: schema = json.load(f)
-          with open('version.json', encoding='utf-8') as f: manifest = json.load(f)
+          import json, jsonschema
+          schema   = json.load(open('installer/manifest-schema.json', encoding='utf-8'))
+          manifest = json.load(open('version.json', encoding='utf-8'))
           jsonschema.validate(manifest, schema)
           print("Manifest OK")
           PYCODE
-
-      - name: Done
-        shell: pwsh
-        run: echo "Build and publish OK for $Env:GITHUB_REF_NAME"
